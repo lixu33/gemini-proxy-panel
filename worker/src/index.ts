@@ -668,9 +668,13 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 			workerApiKey ? env.WORKER_CONFIG_KV.get(KV_KEY_WORKER_KEYS_SAFETY) : Promise.resolve(null) // Fetches string or null
 		]);
 
-		modelInfo = modelsConfig?.[requestedModelId];
+		// 统一用actualModelId查找模型配置
+		const isSearchModel = requestedModelId.endsWith('-search');
+		const actualModelId = isSearchModel ? requestedModelId.replace('-search', '') : requestedModelId;
+
+		modelInfo = modelsConfig?.[actualModelId];
 		if (!modelInfo) {
-			return new Response(JSON.stringify({ error: `Model '${requestedModelId}' is not configured.` }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+			return new Response(JSON.stringify({ error: `Model '${actualModelId}' is not configured.` }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 		}
 		modelCategory = modelInfo.category;
 
@@ -808,7 +812,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				const apiAction = actualStreamMode ? 'streamGenerateContent' : 'generateContent';
 				const querySeparator = actualStreamMode ? '?alt=sse&' : '?'; // Use alt=sse only if actually streaming to Gemini
 
-				// For -search models, use the original model name
+				// Always use actualModelId (without -search suffix) for the API request
 				const geminiUrl = `${GEMINI_BASE_URL}/v1beta/models/${actualModelId}:${apiAction}${querySeparator}key=${selectedKey.key}`;
 
 				const geminiRequestHeaders = new Headers();
@@ -881,6 +885,9 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 						...corsHeaders()
 					});
 
+					// Always use the original requestedModelId (with -search suffix if present) for responses to client
+					const responseModelId = requestedModelId;
+
 					// --- KEEPALIVE MODE ---
 					if (useKeepAlive) {
 						const geminiJson = await geminiResponse.json(); // Get full response (since actualStreamMode was false)
@@ -925,8 +932,8 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 									console.log("Initial keepalive chunk sent.");
 									keepAliveTimer = setTimeout(sendKeepAlive, 5000);
 
-									// Transform the complete Gemini response
-									const openaiResponseObject = transformGeminiResponseToOpenAIObject(geminiJson, requestedModelId!);
+									// Transform the complete Gemini response - use original model ID with search suffix if present
+									const openaiResponseObject = transformGeminiResponseToOpenAIObject(geminiJson, responseModelId);
 
 									// Extract necessary parts
 									const finalMessage = openaiResponseObject?.choices?.[0]?.message;
@@ -1020,7 +1027,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 												continue;
 											}
 											const jsonData = JSON.parse(trimmedData);
-											const openaiChunkStr = transformGeminiStreamChunk(jsonData, requestedModelId!);
+											const openaiChunkStr = transformGeminiStreamChunk(jsonData, responseModelId);
 											if (openaiChunkStr) controller.enqueue(new TextEncoder().encode(openaiChunkStr));
 										} catch (e) {
 											console.error("Error parsing/transforming stream line:", line, e);
@@ -1039,7 +1046,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 										const trimmedData = buffer.substring(6).trim();
 										if (trimmedData.length > 0 && trimmedData !== '[DONE]') {
 											const jsonData = JSON.parse(trimmedData);
-											const openaiChunkStr = transformGeminiStreamChunk(jsonData, requestedModelId!);
+											const openaiChunkStr = transformGeminiStreamChunk(jsonData, responseModelId);
 											if (openaiChunkStr) controller.enqueue(new TextEncoder().encode(openaiChunkStr));
 										}
 									} catch (e) {
@@ -1076,7 +1083,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 						}
 						
 						// Use the object transformation function
-						const openaiJsonObject = transformGeminiResponseToOpenAIObject(geminiJson, requestedModelId!);
+						const openaiJsonObject = transformGeminiResponseToOpenAIObject(geminiJson, responseModelId);
 						return new Response(JSON.stringify(openaiJsonObject), { status: 200, headers: responseHeaders });
 					}
 					// --- ERROR: STREAM EXPECTED BUT NO BODY ---
@@ -2523,7 +2530,7 @@ async function handle429Error(keyId: string, env: Env, category: 'Pro' | 'Flash'
 		let consecutive429Counts = keyInfoData.consecutive429Counts || {};
 
 		// Determine the specific counter key (model ID or category string)
-		// Since we only track quota-exceeded errors now, no need for a prefix
+		// Use keyId as prefix to ensure each key has its own independent counter
 		let counterKey: string | undefined = undefined;
 		let needsQuotaCheck = false; // Does this model/category have a quota defined?
 
@@ -2537,19 +2544,19 @@ async function handle429Error(keyId: string, env: Env, category: 'Pro' | 'Flash'
 		const modelConfig = modelId ? modelsConfig[modelId] : undefined;
 
 		if (category === 'Custom' && modelId) {
-			counterKey = modelId; // Use modelId directly (no prefix needed)
+			counterKey = `${keyId}-${modelId}`; // Prefix with keyId for uniqueness
 			needsQuotaCheck = !!modelConfig?.dailyQuota;
 		} else if ((category === 'Pro' || category === 'Flash') && modelId && modelConfig?.individualQuota) {
 			// Pro/Flash model *with* individual quota -> use model ID as key
-			counterKey = modelId; // Use modelId directly (no prefix needed)
+			counterKey = `${keyId}-${modelId}`; // Prefix with keyId for uniqueness
 			needsQuotaCheck = true; // Individual quota exists
 		} else if (category === 'Pro') {
 			// Pro model *without* individual quota -> use category key
-			counterKey = 'category:pro';
+			counterKey = `${keyId}-category:pro`; // Prefix with keyId for uniqueness
 			needsQuotaCheck = !!categoryQuotas?.proQuota && isFinite(categoryQuotas.proQuota);
 		} else if (category === 'Flash') {
 			// Flash model *without* individual quota -> use category key
-			counterKey = 'category:flash';
+			counterKey = `${keyId}-category:flash`; // Prefix with keyId for uniqueness
 			needsQuotaCheck = !!categoryQuotas?.flashQuota && isFinite(categoryQuotas.flashQuota);
 		}
 
